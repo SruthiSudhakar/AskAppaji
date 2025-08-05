@@ -86,7 +86,7 @@ bnb_config = transformers.BitsAndBytesConfig(
     bnb_4bit_use_double_quant=True,
     bnb_4bit_compute_dtype=bfloat16
 )
-hf_auth = os.environ.get('HF_API_KEY')
+hf_auth = os.environ.get('HF_TOKEN')  # or use getpass()
 model_config = transformers.AutoConfig.from_pretrained(model_dir,use_auth_token=hf_auth)
 model = transformers.AutoModelForCausalLM.from_pretrained(model_dir,trust_remote_code=True,config=model_config,quantization_config=bnb_config,use_auth_token=hf_auth,)
 model.to("cuda")
