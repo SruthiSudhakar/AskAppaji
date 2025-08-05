@@ -33,7 +33,7 @@ from datasets import load_dataset
 
 
 """SETTING UP PINECONE"""
-PINECONE_API_KEY = '4b46f5d6-ba2e-4fc7-950d-c64897e4ed02' #os.environ.get("PINECONE_API_KEY")
+PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index_name = 'appaji-speeches-v2'
 if not pc.has_index(index_name):
@@ -86,7 +86,7 @@ bnb_config = transformers.BitsAndBytesConfig(
     bnb_4bit_use_double_quant=True,
     bnb_4bit_compute_dtype=bfloat16
 )
-hf_auth = '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'
+hf_auth = os.environ.get('HF_API_KEY')
 model_config = transformers.AutoConfig.from_pretrained(model_dir,use_auth_token=hf_auth)
 model = transformers.AutoModelForCausalLM.from_pretrained(model_dir,trust_remote_code=True,config=model_config,quantization_config=bnb_config,use_auth_token=hf_auth,)
 model.to("cuda")
