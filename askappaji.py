@@ -1,41 +1,37 @@
-from langchain_text_splitters import MarkdownHeaderTextSplitter
-from langchain_core.documents import Document
-import requests
-import os
-from getpass import getpass
 from pinecone import Pinecone
 from pinecone import ServerlessSpec
 from torch import cuda
 from langchain_pinecone import PineconeVectorStore
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain.chat_models import init_chat_model
+from langchain_huggingface import HuggingFaceEmbeddings
 import pdb
 import time
 import transformers
 from torch import cuda, bfloat16
 from langchain_community.llms import HuggingFacePipeline
 from datasets import load_dataset
+import gradio as gr
 
 # """DATA PREPROCESSING"""
 
-# batch_size = 32
-# data = load_dataset("ss6638/AppajiSpeeches",data_dir="data", split="train",)
-# data = data.to_pandas()
-# print('datalen',len(data))
-# pineconde_docs=[]
-# for i in range(0, len(data), batch_size):
-#     i_end = min(len(data), i+batch_size)
-#     batch = data.iloc[i:i_end]
-#     ids = [f"{x['discourse_date']}-{str(i)}" for i, x in batch.iterrows()]
-#     pineconde_docs.extend([x['discourse_chunk'] for i, x in batch.iterrows()])
-# pinecone_docs = pineconde_docs
+batch_size = 32
+data = load_dataset("ss6638/AppajiSpeeches",data_dir="data", split="train",)
+data = data.to_pandas()
+print('datalen',len(data))
+appaji_speeches_texts_data=[]
+appaji_speeches_metadata=[]
+for i in range(0, len(data), batch_size):
+    i_end = min(len(data), i+batch_size)
+    batch = data.iloc[i:i_end]
+    texts = [f"{x['discourse_chunk']}-{str(i)}" for i, x in batch.iterrows()]
+    metadatas = [{"date": x['discourse_date'], "link": x['discourse_link']} for i, x in batch.iterrows()]
+    appaji_speeches_texts_data.extend(texts)
+    appaji_speeches_metadata.extend(metadatas)
 
 
 """SETTING UP PINECONE"""
 PINECONE_API_KEY = '4b46f5d6-ba2e-4fc7-950d-c64897e4ed02' #os.environ.get("PINECONE_API_KEY")
 pc = Pinecone(api_key=PINECONE_API_KEY)
-index_name = 'appaji-speeches-v2'
+index_name = 'appaji-speeches-v3'
 if not pc.has_index(index_name):
     pc.create_index(
         name=index_name,
@@ -50,7 +46,6 @@ if not pc.has_index(index_name):
     )
     while not pc.describe_index(index_name).status['ready']:
         time.sleep(1)
-
 # Initialize index client
 index = pc.Index(name=index_name)
 index.describe_index_stats()
@@ -59,26 +54,63 @@ index.describe_index_stats()
 """EMBEDDING DOCUMENTS"""
 model_name = "sentence-transformers/all-MiniLM-L6-v2"
 embeddings = HuggingFaceEmbeddings(model_name=model_name)
-
 vector_store = PineconeVectorStore(index=index, embedding=embeddings)
 
-def clean_url_for_title(url):
-    # do url_title, chunk_num to enable subscriptable hashing and replacement
-    # grabs the end of the url minus .md
-    return url.split("/")[-1].replace(".md", "")
-def generate_ids(doc_chunk):
-    # Here, we follow a schema that puts the document name, and the chunk number together, like doc1#chunk1
-    title = clean_url_for_title(doc_chunk.metadata['source'])
-    chunk_num = doc_chunk.metadata['chunk_num']
-    feature = doc_chunk.metadata['feature'] if 'feature' in doc_chunk.metadata else "na"
-    return f"release_{title}#feature_{feature}#chunk_num{chunk_num}"
+# Check if index already has documents
+index_stats = index.describe_index_stats()
+existing_vectors = index_stats.get('total_vector_count', 0)
 
-ids = [generate_ids(doc) for doc in pinecone_docs]
-vector_store.add_documents(documents=pinecone_docs, ids=ids)
+if existing_vectors > 0:
+    print(f"Index already contains {existing_vectors} vectors")
+    
+    # Check for duplicates based on metadata
+    existing_count = 0
+    new_texts = []
+    new_metadatas = []
+    
+    for text, metadata in zip(appaji_speeches_texts_data, appaji_speeches_metadata):
+        # Create a unique ID based on date and link
+        doc_id = f"{metadata.get('date', '')}_{metadata.get('link', '')}".replace(" ", "_").replace("/", "_")[:512]
+        
+        # Check if this ID exists in the index
+        try:
+            fetch_response = index.fetch(ids=[doc_id])
+            if doc_id in fetch_response.get('vectors', {}):
+                existing_count += 1
+                continue
+        except:
+            pass
+        
+        # Add text hash to metadata for future reference
+        enhanced_metadata = metadata.copy()
+        enhanced_metadata['text_hash'] = str(hash(text))[:20]  # Store hash for comparison
+        
+        new_texts.append(text)
+        new_metadatas.append(enhanced_metadata)
+    
+    print(f"Found {existing_count} existing documents, adding {len(new_texts)} new documents")
+    
+    if new_texts:
+        # Use custom IDs based on metadata for easier duplicate detection
+        ids = [f"{meta.get('date', '')}_{meta.get('link', '')}".replace(" ", "_").replace("/", "_")[:512] for meta in new_metadatas]
+        texts = vector_store.add_texts(new_texts, metadatas=new_metadatas, ids=ids)
+    else:
+        print("No new documents to add")
+else:
+    print(f"Index is empty, adding all {len(appaji_speeches_texts_data)} documents")
+    # For first-time addition, create IDs based on metadata
+    ids = [f"{meta.get('date', '')}_{meta.get('link', '')}".replace(" ", "_").replace("/", "_")[:512] for meta in appaji_speeches_metadata]
+    # Add text hash to metadata for future duplicate detection
+    enhanced_metadatas = []
+    for text, metadata in zip(appaji_speeches_texts_data, appaji_speeches_metadata):
+        enhanced_metadata = metadata.copy()
+        enhanced_metadata['text_hash'] = str(hash(text))[:20]
+        enhanced_metadatas.append(enhanced_metadata)
+    texts = vector_store.add_texts(appaji_speeches_texts_data, metadatas=enhanced_metadatas, ids=ids)
 
 
 """LLM SETUP"""
-model_dir = '/local/zemel/weights/llama-7b' # Meta-Llama-3-70B-Instruct,gemma-2-9b-it
+model_dir = '/local/zemel/weights/Llama-2-7b-chat-hf' # Meta-Llama-3-70B-Instruct,gemma-2-9b-it
 device = f'cuda:{cuda.current_device()}' if cuda.is_available() else 'cpu'
 bnb_config = transformers.BitsAndBytesConfig(
     load_in_4bit=True,
@@ -86,7 +118,7 @@ bnb_config = transformers.BitsAndBytesConfig(
     bnb_4bit_use_double_quant=True,
     bnb_4bit_compute_dtype=bfloat16
 )
-hf_auth = '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'
+hf_auth = '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'
 model_config = transformers.AutoConfig.from_pretrained(model_dir,use_auth_token=hf_auth)
 model = transformers.AutoModelForCausalLM.from_pretrained(model_dir,trust_remote_code=True,config=model_config,quantization_config=bnb_config,use_auth_token=hf_auth,)
 model.to("cuda")
@@ -105,37 +137,40 @@ llm = HuggingFacePipeline(pipeline=generate_text)
 
 
 
+"""ASK APPAJI FUNCTION"""
+def ask_appaji(query):
+    retrieved_docs = vector_store.similarity_search(query, k=5)
+    docs_content = "\n\n".join(doc.page_content for doc in retrieved_docs)
+    
+    # Llama-2-chat format with system prompt
+    system_prompt = "You are a helpful assistant that answers questions exclusively based on the context provided from Appaji's speeches. Be concise and accurate. If the context doesn't contain relevant information, say 'I don't have enough information from Appaji's speeches to answer this question.'"
+    
+    prompt = f'''<s>[INST] <<SYS>>
+{system_prompt}
+<</SYS>>
 
-
-
-
-"""USING LLM"""
-query = "Tell me about version 7.0 of the Pinecone Python SDK"
-
-retrieved_docs = vector_store.similarity_search(query, k=5)
-docs_content = "\n\n".join(doc.page_content for doc in retrieved_docs)
-
-prompt = f'''You are an assistant that answers questions exclusively about the 
-Pinecone SDK release notes:
-
-Here's a question: {query}
-
-Here's some context from the release notes:
-
+Here is possibly relevant context from the speeches:
 {docs_content}
 
+Question: {query} [/INST]'''
+    print('starting llm invocation')
+    response = llm.invoke(prompt)
+    print('got response from llm')
+    # Extract answer from Llama-2 format response
+    if "[/INST]" in response:
+        answer = response.split("[/INST]")[-1].strip()
+    else:
+        answer = response.strip()
+    answer += "\n\nSources:\n\n"
+    for num, d in enumerate(retrieved_docs):
+        answer+=f"Source {num+1}: " + d.page_content + f"[{d.metadata['link']}]" + "\n\n" 
+    return answer
 
-Question: {query}
-
-Answer:
-'''
-
-# This will take a few seconds to run, due to the generation of the response from OpenAI
-answer = llm.invoke(prompt)
-pdb.set_trace()
-for num, d in enumerate(retrieved_docs):
-    print(f"Doc number: {num+1}")
-    print(d.page_content)
-    print("Metadata:")
-    print(d.metadata)
-    print("-"*100)
+demo = gr.Interface(
+    fn=ask_appaji,
+    inputs=gr.Textbox(label="Question"),
+    outputs=gr.Textbox(label="Answer"),
+    title="Ask Appaji",
+    description="Ask questions about Appaji's speeches"
+)
+demo.launch(share=True)
